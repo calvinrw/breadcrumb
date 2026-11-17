@@ -193,47 +193,61 @@ property on every node."
 (defvar-local bc--ipath-plain-cache nil
   "A cache for `breadcrumb--ipath-plain'.")
 
+(defvar bc--last-update-tick) ; Defined below.
+
 (defun bc--ipath-plain (index-alist pos)
   "Compute ipath for plain `imenu--index-alist' structures.
 These structures don't have region properties on."
-  (cl-labels ((dfs (n &optional ipath siblings)
-                (setq ipath (cons (car n) ipath))
-                (cond
-                 ((imenu--subalist-p n)
-                  (mapcan (lambda (n2) (dfs n2 ipath (cdr n))) (cdr n)))
-                 ;; Empty submenus or "special elements" (NAME POS
-                 ;; FUNCTION ARGS...), whose POS isn't necessarily a
-                 ;; buffer position (github#51).  See docstring of
-                 ;; `imenu--index-alist'.
-                 ((listp (cdr n)) nil)
-                 (t
-                  ;; FIXME: we convert markers to points via the `+'
-                  ;; down there.  But for siblings, no such conversion
-                  ;; happens, they might still point to invalid
-                  ;; markers.  Not worth doing another tree traversal
-                  ;; for that IMO, and siblings seems to be unused
-                  ;; anyway (github#22)
-                  (unless (string-empty-p (car ipath)) ; github#36
-                    (put-text-property 0 1 'breadcrumb-siblings (cdr siblings)
-                                       (car ipath)))
-                  (list (cons
-                         ;; See github#17 and docstring of
-                         ;; `imenu--index-alist' for the
-                         ;; "overlay" edge case.
-                         (cl-etypecase (cdr n)
-                           (number (cdr n))
-                           (marker (+ (cdr n) 0))
-                           (overlay (overlay-start (cdr n))))
-                         ipath))))))
-    (unless bc--ipath-plain-cache
-      (setq bc--ipath-plain-cache
-            (cl-sort (vconcat (mapcan (lambda (i) (dfs i nil index-alist))
-                                      index-alist))
-                     #'< :key #'car)))
-    (when (and (length> bc--ipath-plain-cache 0)
-               (>= pos (car (aref bc--ipath-plain-cache 0))))
-      (let ((res (bc--bisect bc--ipath-plain-cache pos :key #'car :from-end t)))
-        (unless (zerop res) (reverse (cdr (elt bc--ipath-plain-cache (1- res)))))))))
+  (let (stale)
+    (cl-labels ((dfs (n &optional ipath siblings)
+                  (setq ipath (cons (car n) ipath))
+                  (cond
+                   ((imenu--subalist-p n)
+                    (mapcan (lambda (n2) (dfs n2 ipath (cdr n))) (cdr n)))
+                   ;; Empty submenus or "special elements" (NAME POS
+                   ;; FUNCTION ARGS...), whose POS isn't necessarily a
+                   ;; buffer position (github#51).  See docstring of
+                   ;; `imenu--index-alist'.
+                   ((listp (cdr n)) nil)
+                   (t
+                    ;; FIXME: we convert markers to points via
+                    ;; `marker-position' down there.  But for siblings, no such conversion
+                    ;; happens, they might still point to invalid
+                    ;; markers.  Not worth doing another tree traversal
+                    ;; for that IMO, and siblings seems to be unused
+                    ;; anyway (github#22)
+                    (unless (string-empty-p (car ipath)) ; github#36
+                      (put-text-property 0 1 'breadcrumb-siblings (cdr siblings)
+                                         (car ipath)))
+                    ;; See github#17 and docstring of
+                    ;; `imenu--index-alist' for the "overlay" edge case.
+                    (let ((p (cl-etypecase (cdr n)
+                               (number (cdr n))
+                               (marker (marker-position (cdr n)))
+                               (overlay (overlay-start (cdr n))))))
+                      ;; A marker or overlay that points nowhere means
+                      ;; the index is stale: e.g. Org's index function
+                      ;; detaches every marker of its previous index
+                      ;; each time it runs, and its caller may not have
+                      ;; stored the new one in `imenu--index-alist'.
+                      ;; Skip the node, and ask for a fresh index below.
+                      (if p (list (cons p ipath))
+                        (setq stale t)
+                        nil))))))
+      (unless bc--ipath-plain-cache
+        (setq bc--ipath-plain-cache
+              (cl-sort (vconcat (mapcan (lambda (i) (dfs i nil index-alist))
+                                        index-alist))
+                       #'< :key #'car))
+        (when stale
+          ;; Make `breadcrumb--ipath-alist' schedule a rebuild, which
+          ;; also clears this cache.
+          (with-current-buffer (or (buffer-base-buffer) (current-buffer))
+            (setq bc--last-update-tick -1))))
+      (when (and (length> bc--ipath-plain-cache 0)
+                 (>= pos (car (aref bc--ipath-plain-cache 0))))
+        (let ((res (bc--bisect bc--ipath-plain-cache pos :key #'car :from-end t)))
+          (unless (zerop res) (reverse (cdr (elt bc--ipath-plain-cache (1- res))))))))))
 
 (defun bc-ipath (index-alist pos)
   "Get breadcrumb for position POS given INDEX-ALIST."
